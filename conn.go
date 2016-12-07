@@ -2,6 +2,7 @@ package gotcp
 
 import (
 	"errors"
+	"github.com/huoyan108/logs"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -72,8 +73,6 @@ func (c *Conn) Close() {
 	c.closeOnce.Do(func() {
 		atomic.StoreInt32(&c.closeFlag, 1)
 		close(c.closeChan)
-		close(c.packetSendChan)
-		close(c.packetReceiveChan)
 		c.conn.Close()
 		c.srv.callback.OnClose(c)
 	})
@@ -84,17 +83,40 @@ func (c *Conn) IsClosed() bool {
 	return atomic.LoadInt32(&c.closeFlag) == 1
 }
 
+// AsyncReadPacket async reads a packet, this method will never block
+func (c *Conn) AsyncReadPacket(timeout time.Duration) (Packet, error) {
+	if c.IsClosed() {
+		return nil, ErrConnClosing
+	}
+
+	if timeout == 0 {
+		select {
+		case p := <-c.packetReceiveChan:
+			return p, nil
+
+		default:
+			return nil, ErrReadBlocking
+		}
+
+	} else {
+		select {
+		case p := <-c.packetReceiveChan:
+			return p, nil
+
+		case <-c.closeChan:
+			return nil, ErrConnClosing
+
+		case <-time.After(timeout):
+			return nil, ErrReadBlocking
+		}
+	}
+}
+
 // AsyncWritePacket async writes a packet, this method will never block
-func (c *Conn) AsyncWritePacket(p Packet, timeout time.Duration) (err error) {
+func (c *Conn) AsyncWritePacket(p Packet, timeout time.Duration) error {
 	if c.IsClosed() {
 		return ErrConnClosing
 	}
-
-	defer func() {
-		if e := recover(); e != nil {
-			err = ErrConnClosing
-		}
-	}()
 
 	if timeout == 0 {
 		select {
@@ -125,15 +147,17 @@ func (c *Conn) Do() {
 		return
 	}
 
-	asyncDo(c.handleLoop, c.srv.waitGroup)
-	asyncDo(c.readLoop, c.srv.waitGroup)
-	asyncDo(c.writeLoop, c.srv.waitGroup)
+	go c.handleLoop()
+	go c.readLoop()
+	go c.writeLoop()
 }
 
 func (c *Conn) readLoop() {
+	c.srv.waitGroup.Add(1)
 	defer func() {
 		recover()
 		c.Close()
+		c.srv.waitGroup.Done()
 	}()
 
 	for {
@@ -147,7 +171,7 @@ func (c *Conn) readLoop() {
 		default:
 		}
 
-		p, err := c.srv.protocol.ReadPacket(c.conn)
+		p, err := c.srv.protocol.ReadPacket(c)
 		if err != nil {
 			return
 		}
@@ -157,9 +181,11 @@ func (c *Conn) readLoop() {
 }
 
 func (c *Conn) writeLoop() {
+	c.srv.waitGroup.Add(1)
 	defer func() {
 		recover()
 		c.Close()
+		c.srv.waitGroup.Done()
 	}()
 
 	for {
@@ -171,20 +197,21 @@ func (c *Conn) writeLoop() {
 			return
 
 		case p := <-c.packetSendChan:
-			if c.IsClosed() {
-				return
-			}
 			if _, err := c.conn.Write(p.Serialize()); err != nil {
 				return
 			}
+			logs.Logger.Info("<OUT>    ", string(p.Serialize()))
+			logs.Logger.Flush()
 		}
 	}
 }
 
 func (c *Conn) handleLoop() {
+	c.srv.waitGroup.Add(1)
 	defer func() {
 		recover()
 		c.Close()
+		c.srv.waitGroup.Done()
 	}()
 
 	for {
@@ -196,20 +223,9 @@ func (c *Conn) handleLoop() {
 			return
 
 		case p := <-c.packetReceiveChan:
-			if c.IsClosed() {
-				return
-			}
 			if !c.srv.callback.OnMessage(c, p) {
 				return
 			}
 		}
 	}
-}
-
-func asyncDo(fn func(), wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		fn()
-		wg.Done()
-	}()
 }
